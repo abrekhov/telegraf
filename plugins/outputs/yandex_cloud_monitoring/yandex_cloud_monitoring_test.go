@@ -14,19 +14,18 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-func TestWrite(t *testing.T) {
-	readBody := func(r *http.Request) yandexCloudMonitoringMessage {
-		decoder := json.NewDecoder(r.Body)
-		var message yandexCloudMonitoringMessage
-		err := decoder.Decode(&message)
-		require.NoError(t, err)
-		return message
-	}
+func readBody(r *http.Request) (yandexCloudMonitoringMessage, error) {
+	decoder := json.NewDecoder(r.Body)
+	var message yandexCloudMonitoringMessage
+	err := decoder.Decode(&message)
+	return message, err
+}
 
+func TestWrite(t *testing.T) {
 	testMetadataHTTPServer := httptest.NewServer(
 		http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			if strings.HasSuffix(r.URL.Path, "/token") {
-				token := MetadataIamToken{
+				token := metadataIamToken{
 					AccessToken: "token1",
 					ExpiresIn:   123,
 				}
@@ -68,9 +67,10 @@ func TestWrite(t *testing.T) {
 				),
 			},
 			handler: func(t *testing.T, w http.ResponseWriter, r *http.Request) {
-				message := readBody(r)
+				message, err := readBody(r)
+				require.NoError(t, err)
 				require.Len(t, message.Metrics, 1)
-				require.Equal(t, "cpu", message.Metrics[0].Name)
+				require.Equal(t, "cluster_cpu", message.Metrics[0].Name)
 				require.Equal(t, 42.0, message.Metrics[0].Value)
 				w.WriteHeader(http.StatusOK)
 			},
@@ -89,9 +89,10 @@ func TestWrite(t *testing.T) {
 				),
 			},
 			handler: func(t *testing.T, w http.ResponseWriter, r *http.Request) {
-				message := readBody(r)
+				message, err := readBody(r)
+				require.NoError(t, err)
 				require.Len(t, message.Metrics, 1)
-				require.Equal(t, "value", message.Metrics[0].Name)
+				require.Equal(t, "cluster_value", message.Metrics[0].Name)
 				require.Equal(t, float64(9.223372036854776e+18), message.Metrics[0].Value)
 				w.WriteHeader(http.StatusOK)
 			},
@@ -110,9 +111,35 @@ func TestWrite(t *testing.T) {
 				),
 			},
 			handler: func(t *testing.T, w http.ResponseWriter, r *http.Request) {
-				message := readBody(r)
+				message, err := readBody(r)
+				require.NoError(t, err)
 				require.Len(t, message.Metrics, 1)
-				require.Equal(t, "value", message.Metrics[0].Name)
+				require.Equal(t, "cluster_value", message.Metrics[0].Name)
+				require.Equal(t, float64(9226), message.Metrics[0].Value)
+				w.WriteHeader(http.StatusOK)
+			},
+		},
+		{
+			name:   "label with name 'name' is replaced with '_name'",
+			plugin: &YandexCloudMonitoring{},
+			metrics: []telegraf.Metric{
+				testutil.MustMetric(
+					"cluster",
+					map[string]string{
+						"name": "accounts-daemon.service",
+					},
+					map[string]interface{}{
+						"value": 9226,
+					},
+					time.Unix(0, 0),
+				),
+			},
+			handler: func(t *testing.T, w http.ResponseWriter, r *http.Request) {
+				message, err := readBody(r)
+				require.NoError(t, err)
+				require.Len(t, message.Metrics, 1)
+				require.Equal(t, "cluster_value", message.Metrics[0].Name)
+				require.Contains(t, message.Metrics[0].Labels, "_name")
 				require.Equal(t, float64(9226), message.Metrics[0].Value)
 				w.WriteHeader(http.StatusOK)
 			},
@@ -123,16 +150,49 @@ func TestWrite(t *testing.T) {
 			ts.Config.Handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				tt.handler(t, w, r)
 			})
-			tt.plugin.Log = testutil.Logger{}
-			tt.plugin.EndpointURL = url
-			tt.plugin.MetadataTokenURL = metadataTokenURL
-			tt.plugin.MetadataFolderURL = metadataFolderURL
-			err := tt.plugin.Connect()
-			require.NoError(t, err)
+			tt.plugin = &YandexCloudMonitoring{
+				Endpoint:          url,
+				metadataTokenURL:  metadataTokenURL,
+				metadataFolderURL: metadataFolderURL,
+				Log:               testutil.Logger{},
+			}
+			require.NoError(t, tt.plugin.Init())
+			require.NoError(t, tt.plugin.Connect())
+			require.NoError(t, tt.plugin.Write(tt.metrics))
+		})
+	}
+}
 
-			err = tt.plugin.Write(tt.metrics)
+func TestReplaceReservedTagNames(t *testing.T) {
+	tagMap := map[string]string{
+		"name":  "value",
+		"other": "value",
+	}
+	wantTagMap := map[string]string{
+		"_name": "value",
+		"other": "value",
+	}
 
-			require.NoError(t, err)
+	type args struct {
+		tagNames map[string]string
+	}
+	tests := []struct {
+		name string
+		args args
+		want map[string]string
+	}{
+		{
+			name: "tagReplacement",
+			args: args{
+				tagNames: tagMap,
+			},
+			want: wantTagMap,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := replaceReservedTagNames(tt.args.tagNames)
+			require.EqualValues(t, tt.want, got)
 		})
 	}
 }

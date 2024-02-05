@@ -1,7 +1,7 @@
 # Yandex Cloud Monitoring Output Plugin
 
-This plugin will send custom metrics to [Yandex Cloud
-Monitoring](https://cloud.yandex.com/services/monitoring).
+This plugin will send custom metrics to
+[Yandex Cloud Monitoring](https://cloud.yandex.ru/en/docs/monitoring/quickstart).
 
 ## Global configuration options <!-- @/docs/includes/plugin_config.md -->
 
@@ -21,17 +21,68 @@ See the [CONFIGURATION.md][CONFIGURATION.md] for more details.
   # timeout = "20s"
 
   ## Yandex.Cloud monitoring API endpoint. Normally should not be changed
-  # endpoint_url = "https://monitoring.api.cloud.yandex.net/monitoring/v2/data/write"
-
-  ## All user metrics should be sent with "custom" service specified. Normally should not be changed
-  # service = "custom"
+  # endpoint = "https://monitoring.api.cloud.yandex.net/monitoring/v2/data/write"
 ```
 
 ### Authentication
 
-This plugin currently support only YC.Compute metadata based authentication.
+This plugin currently only supports Compute metadata based authentication
+in Yandex Cloud Platform.
 
-When plugin is working inside a YC.Compute instance it will take IAM token and
-Folder ID from instance metadata.
+When plugin is working inside a Compute instance it will take IAM token and
+Folder ID from instance metadata. In this plugin we use [Google Cloud notation]
+This internal metadata endpoint is only accessible for VMs from the cloud.
 
-Other authentication methods will be added later.
+[Google Cloud notation]: https://cloud.yandex.com/en/docs/compute/operations/vm-info/get-info#gce-metadata
+
+### Reserved Labels
+
+Yandex Monitoring backend using json format to receive the metrics:
+
+```json
+{
+  "name": "metric_name",
+  "labels": {
+    "key": "value",
+    "foo": "bar"
+  },
+  "ts": "2023-06-06T11:10:50Z",
+  "value": 0
+}
+```
+
+But key of label cannot be `name` because it's reserved for `metric_name`.
+
+So this payload:
+
+```json
+{
+  "name": "systemd_units_load_code",
+  "labels": {
+    "active": "active",
+    "host": "vm",
+    "load": "loaded",
+    "name": "accounts-daemon.service",
+    "sub": "running"
+  },
+  "ts": "2023-06-06T11:10:50Z",
+  "value": 0
+}
+```
+
+will be replaced with:
+
+```json
+{
+  "name": "systemd_units_load_code",
+  "labels": {
+    "active": "active",
+    "host": "vm",
+    "load": "loaded",
+    "_name": "accounts-daemon.service",
+    "sub": "running"
+  },
+  "ts": "2023-06-06T11:10:50Z",
+  "value": 0
+}
+```

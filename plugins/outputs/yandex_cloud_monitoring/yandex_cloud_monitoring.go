@@ -23,21 +23,19 @@ var sampleConfig string
 // YandexCloudMonitoring allows publishing of metrics to the Yandex Cloud Monitoring custom metrics
 // service
 type YandexCloudMonitoring struct {
-	Timeout     config.Duration `toml:"timeout"`
-	EndpointURL string          `toml:"endpoint_url"`
-	Service     string          `toml:"service"`
+	Timeout  config.Duration `toml:"timeout"`
+	Endpoint string          `toml:"endpoint"`
+	Service  string          `toml:"service"`
 
-	Log telegraf.Logger
+	Log telegraf.Logger `toml:"-"`
 
-	MetadataTokenURL       string
-	MetadataFolderURL      string
-	FolderID               string
-	IAMToken               string
-	IamTokenExpirationTime time.Time
+	metadataTokenURL       string
+	metadataFolderURL      string
+	folderID               string
+	iamToken               string
+	iamTokenExpirationTime time.Time
 
 	client *http.Client
-
-	timeFunc func() time.Time
 
 	MetricOutsideWindow selfstat.Stat
 }
@@ -56,7 +54,7 @@ type yandexCloudMonitoringMetric struct {
 	Value      float64           `json:"value"`
 }
 
-type MetadataIamToken struct {
+type metadataIamToken struct {
 	AccessToken string `json:"access_token"`
 	ExpiresIn   int64  `json:"expires_in"`
 	TokenType   string `json:"token_type"`
@@ -64,32 +62,35 @@ type MetadataIamToken struct {
 
 const (
 	defaultRequestTimeout = time.Second * 20
-	defaultEndpointURL    = "https://monitoring.api.cloud.yandex.net/monitoring/v2/data/write"
+	defaultEndpoint       = "https://monitoring.api.cloud.yandex.net/monitoring/v2/data/write"
+	/*
+		There is no DNS for metadata endpoint in Yandex Cloud yet.
+		So the only way is to hardcode reserved IP (https://en.wikipedia.org/wiki/Link-local_address)
+	*/
 	//nolint:gosec // G101: Potential hardcoded credentials - false positive
 	defaultMetadataTokenURL  = "http://169.254.169.254/computeMetadata/v1/instance/service-accounts/default/token"
-	defaultMetadataFolderURL = "http://169.254.169.254/computeMetadata/v1/yandex/folder-id"
+	defaultMetadataFolderURL = "http://169.254.169.254/computeMetadata/v1/instance/vendor/folder-id"
 )
 
 func (*YandexCloudMonitoring) SampleConfig() string {
 	return sampleConfig
 }
 
-// Connect initializes the plugin and validates connectivity
-func (a *YandexCloudMonitoring) Connect() error {
+func (a *YandexCloudMonitoring) Init() error {
 	if a.Timeout <= 0 {
 		a.Timeout = config.Duration(defaultRequestTimeout)
 	}
-	if a.EndpointURL == "" {
-		a.EndpointURL = defaultEndpointURL
+	if a.Endpoint == "" {
+		a.Endpoint = defaultEndpoint
 	}
 	if a.Service == "" {
 		a.Service = "custom"
 	}
-	if a.MetadataTokenURL == "" {
-		a.MetadataTokenURL = defaultMetadataTokenURL
+	if a.metadataTokenURL == "" {
+		a.metadataTokenURL = defaultMetadataTokenURL
 	}
-	if a.MetadataFolderURL == "" {
-		a.MetadataFolderURL = defaultMetadataFolderURL
+	if a.metadataFolderURL == "" {
+		a.metadataFolderURL = defaultMetadataFolderURL
 	}
 
 	a.client = &http.Client{
@@ -98,17 +99,24 @@ func (a *YandexCloudMonitoring) Connect() error {
 		},
 		Timeout: time.Duration(a.Timeout),
 	}
+	tags := map[string]string{}
+	a.MetricOutsideWindow = selfstat.Register("yandex_cloud_monitoring", "metric_outside_window", tags)
+	return nil
+}
 
-	var err error
-	a.FolderID, err = a.getFolderIDFromMetadata()
+// Connect initializes the plugin and validates connectivity
+func (a *YandexCloudMonitoring) Connect() error {
+	a.Log.Debugf("Getting folder ID in %s", a.metadataFolderURL)
+	body, err := a.getResponseFromMetadata(a.client, a.metadataFolderURL)
 	if err != nil {
 		return err
 	}
-
-	a.Log.Infof("Writing to Yandex.Cloud Monitoring URL: %s", a.EndpointURL)
-
-	tags := map[string]string{}
-	a.MetricOutsideWindow = selfstat.Register("yandex_cloud_monitoring", "metric_outside_window", tags)
+	a.folderID = string(body)
+	if a.folderID == "" {
+		return fmt.Errorf("unable to fetch folder id from URL %s: %w", a.metadataFolderURL, err)
+	}
+	a.Log.Infof("Writing to Yandex.Cloud Monitoring URL: %s", a.Endpoint)
+	a.Log.Infof("FolderID: %s", a.folderID)
 
 	return nil
 }
@@ -133,8 +141,8 @@ func (a *YandexCloudMonitoring) Write(metrics []telegraf.Metric) error {
 			yandexCloudMonitoringMetrics = append(
 				yandexCloudMonitoringMetrics,
 				yandexCloudMonitoringMetric{
-					Name:   field.Key,
-					Labels: m.Tags(),
+					Name:   m.Name() + "_" + field.Key,
+					Labels: replaceReservedTagNames(m.Tags()),
 					TS:     m.Time().Format(time.RFC3339),
 					Value:  value,
 				},
@@ -142,21 +150,19 @@ func (a *YandexCloudMonitoring) Write(metrics []telegraf.Metric) error {
 		}
 	}
 
-	var body []byte
-	jsonBytes, err := json.Marshal(
+	body, err := json.Marshal(
 		yandexCloudMonitoringMessage{
 			Metrics: yandexCloudMonitoringMetrics,
 		},
 	)
-
 	if err != nil {
 		return err
 	}
-	body = append(jsonBytes, '\n')
+	body = append(body, '\n')
 	return a.send(body)
 }
 
-func getResponseFromMetadata(c *http.Client, metadataURL string) ([]byte, error) {
+func (a *YandexCloudMonitoring) getResponseFromMetadata(c *http.Client, metadataURL string) ([]byte, error) {
 	req, err := http.NewRequest("GET", metadataURL, nil)
 	if err != nil {
 		return nil, fmt.Errorf("error creating request: %w", err)
@@ -179,59 +185,44 @@ func getResponseFromMetadata(c *http.Client, metadataURL string) ([]byte, error)
 	return body, nil
 }
 
-func (a *YandexCloudMonitoring) getFolderIDFromMetadata() (string, error) {
-	a.Log.Infof("Getting folder ID in %s", a.MetadataFolderURL)
-	body, err := getResponseFromMetadata(a.client, a.MetadataFolderURL)
-	if err != nil {
-		return "", err
-	}
-	folderID := string(body)
-	if folderID == "" {
-		return "", fmt.Errorf("unable to fetch folder id from URL %s: %w", a.MetadataFolderURL, err)
-	}
-	return folderID, nil
-}
-
 func (a *YandexCloudMonitoring) getIAMTokenFromMetadata() (string, int, error) {
-	a.Log.Debugf("Getting new IAM token in %s", a.MetadataTokenURL)
-	body, err := getResponseFromMetadata(a.client, a.MetadataTokenURL)
+	a.Log.Debugf("Getting new IAM token in %s", a.metadataTokenURL)
+	body, err := a.getResponseFromMetadata(a.client, a.metadataTokenURL)
 	if err != nil {
 		return "", 0, err
 	}
-	var metadata MetadataIamToken
+	var metadata metadataIamToken
 	if err := json.Unmarshal(body, &metadata); err != nil {
 		return "", 0, err
 	}
 	if metadata.AccessToken == "" || metadata.ExpiresIn == 0 {
-		return "", 0, fmt.Errorf("unable to fetch authentication credentials %s: %w", a.MetadataTokenURL, err)
+		return "", 0, fmt.Errorf("unable to fetch authentication credentials %s: %w", a.metadataTokenURL, err)
 	}
 	return metadata.AccessToken, int(metadata.ExpiresIn), nil
 }
 
 func (a *YandexCloudMonitoring) send(body []byte) error {
-	req, err := http.NewRequest("POST", a.EndpointURL, bytes.NewBuffer(body))
+	req, err := http.NewRequest("POST", a.Endpoint, bytes.NewBuffer(body))
 	if err != nil {
 		return err
 	}
 	q := req.URL.Query()
-	q.Add("folderId", a.FolderID)
+	q.Add("folderId", a.folderID)
 	q.Add("service", a.Service)
 	req.URL.RawQuery = q.Encode()
 
 	req.Header.Set("Content-Type", "application/json")
-	isTokenExpired := !a.IamTokenExpirationTime.After(time.Now())
-	if a.IAMToken == "" || isTokenExpired {
+	isTokenExpired := a.iamTokenExpirationTime.Before(time.Now())
+	if a.iamToken == "" || isTokenExpired {
 		token, expiresIn, err := a.getIAMTokenFromMetadata()
 		if err != nil {
 			return err
 		}
-		a.IamTokenExpirationTime = time.Now().Add(time.Duration(expiresIn) * time.Second)
-		a.IAMToken = token
+		a.iamTokenExpirationTime = time.Now().Add(time.Duration(expiresIn) * time.Second)
+		a.iamToken = token
 	}
-	req.Header.Set("Authorization", "Bearer "+a.IAMToken)
+	req.Header.Set("Authorization", "Bearer "+a.iamToken)
 
-	a.Log.Debugf("Sending metrics to %s", req.URL.String())
-	a.Log.Debugf("body: %s", body)
 	resp, err := a.client.Do(req)
 	if err != nil {
 		return err
@@ -248,8 +239,18 @@ func (a *YandexCloudMonitoring) send(body []byte) error {
 
 func init() {
 	outputs.Add("yandex_cloud_monitoring", func() telegraf.Output {
-		return &YandexCloudMonitoring{
-			timeFunc: time.Now,
-		}
+		return &YandexCloudMonitoring{}
 	})
+}
+
+func replaceReservedTagNames(tagNames map[string]string) map[string]string {
+	newTags := make(map[string]string, len(tagNames))
+	for tagName, tagValue := range tagNames {
+		if tagName == "name" {
+			newTags["_name"] = tagValue
+		} else {
+			newTags[tagName] = tagValue
+		}
+	}
+	return newTags
 }
